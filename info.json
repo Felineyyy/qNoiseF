@@ -1,0 +1,14 @@
+{
+    "type": "Standard",
+    "name": "Label Below",
+    "icon": ":/CC/plugin/qNoiseF/icon.png",
+    "description": "Use entered label to cull the label do not involve into the noise filtering.",
+    "authors": [
+        {
+            "email": "junyi.tian@outlook.com"
+        }
+    ],
+    "version": "1.0.0",
+    "minCCVersion": "2.12.0",
+    "maxCCVersion": "2.13.99"
+}

@@ -1,0 +1,6 @@
+<RCC>
+  <qresource prefix="/CC/plugin/qNoiseF">
+    <file>info.json</file>
+    <file>icon.png</file>
+  </qresource>
+</RCC>
