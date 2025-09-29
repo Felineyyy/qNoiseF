@@ -7,6 +7,7 @@ class QDoubleSpinBox;
 class QSpinBox;
 class QCheckBox;
 class QRadioButton;
+class QButtonGroup;
 
 class NoiseFDialog : public QDialog
 {
@@ -23,7 +24,11 @@ public:
     bool selectIsolated() const;
     int getExcludedLabel() const;
 
+private slots:
+    void onModeChanged();
+
 private:
+    QButtonGroup* m_modeGroup;
     QRadioButton* m_radiusRadio;
     QRadioButton* m_knnRadio;
     QDoubleSpinBox* m_radiusSpin;
