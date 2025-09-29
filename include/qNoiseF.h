@@ -19,14 +19,15 @@ public:
 
     virtual void onNewSelection(const ccHObject::Container& selectedEntities) override;
     QList<QAction *> getActions() override;
+
 protected slots:
     void doAction();
-    void doNoiseFilter(bool useRadius, double radius, int knn,
+
+private:
+    void doNoiseFilter(ccPointCloud* cloud, bool useRadius, double radius, int knn,
                        int minNeighbors, double maxError,
                        bool selectIsolated, int excludedLabel);
 
-private:
-    ccPointCloud* m_cloud;
     QAction* m_action;
 };
 
