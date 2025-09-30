@@ -1,3 +1,4 @@
+// qNoiseF.cpp
 #include "qNoiseF.h"
 #include "NoiseFDialog.h"
 
@@ -13,26 +14,14 @@
 
 #include <QIcon>
 #include <QWidget>
+#include <cmath>
 #include <vector>
-#include <algorithm>
 
 qNoiseF::qNoiseF(QObject* parent)
     : QObject(parent)
     , ccStdPluginInterface(":/CC/plugin/qNoiseF/info.json")
     , m_action(nullptr)
 {
-}
-
-QList<QAction*> qNoiseF::getActions()
-{
-    if (!m_action)
-    {
-        m_action = new QAction(getName(), this);
-        m_action->setToolTip(getDescription());
-        m_action->setIcon(getIcon());
-        connect(m_action, &QAction::triggered, this, &qNoiseF::doAction);
-    }
-    return { m_action };
 }
 
 QIcon qNoiseF::getIcon() const
@@ -57,31 +46,44 @@ void qNoiseF::onNewSelection(const ccHObject::Container& selectedEntities)
     }
 }
 
+QList<QAction*> qNoiseF::getActions()
+{
+    if (!m_action)
+    {
+        m_action = new QAction(getName(), this);
+        m_action->setToolTip(getDescription());
+        m_action->setIcon(getIcon());
+        connect(m_action, &QAction::triggered, this, &qNoiseF::doAction);
+    }
+    return { m_action };
+}
+
 void qNoiseF::doAction()
 {
-    // Get selected entities from the app interface
-    ccHObject::Container selectedEntities = m_app ? m_app->getSelectedEntities() : ccHObject::Container();
-    
+    // Retrieve the first selected point cloud
     ccPointCloud* cloud = nullptr;
+    ccHObject::Container selectedEntities = m_app ? m_app->getSelectedEntities() : ccHObject::Container();
     for (ccHObject* obj : selectedEntities)
     {
-        cloud = ccHObjectCaster::ToPointCloud(obj);
-        if (cloud)
+        if (obj && obj->isKindOf(CC_TYPES::POINT_CLOUD))
+        {
+            cloud = static_cast<ccPointCloud*>(obj);
             break;
+        }
     }
-    
+
     if (!cloud)
     {
-        ccLog::Warning("[qNoiseF] Please select a point cloud.");
+        ccLog::Warning("[qNoiseF] No valid point cloud selected!");
         return;
     }
 
-    // Show dialog to get parameters
-    NoiseFDialog dlg(m_app ? m_app->getMainWindow() : nullptr);
+    // Parent is set to nullptr to avoid forward-declaration/cast issues
+    NoiseFDialog dlg(nullptr);
     if (dlg.exec() != QDialog::Accepted)
         return;
 
-    // Run the noise filter
+    // Run filter: use dialog params (excludedLabel provided by dialog)
     doNoiseFilter(
         cloud,
         dlg.isRadiusMode(),
@@ -108,20 +110,21 @@ void qNoiseF::doNoiseFilter(ccPointCloud* cloud, bool useRadius, double radius, 
         return;
     }
 
-    // Get label scalar field if it exists
-    int labelSfIdx = cloud->getScalarFieldIndexByName("Label");
-    ccScalarField* labelSf = nullptr;
-    if (labelSfIdx >= 0)
+    // === IMPORTANT CHANGE ===
+    // Use the currently displayed (selected) scalar field on the current cloud,
+    // do NOT search for a scalar field named "Label".
+    ccScalarField* labelSf = cloud->getCurrentDisplayedScalarField();
+    if (labelSf)
     {
-        labelSf = static_cast<ccScalarField*>(cloud->getScalarField(labelSfIdx));
-        ccLog::Print(QString("[qNoiseF] Found Label scalar field, excluding label: %1 from neighbor calculations").arg(excludedLabel));
+        ccLog::Print(QString("[qNoiseF] Using currently displayed scalar field as label SF (size=%1). Excluding label value: %2")
+                     .arg(labelSf->currentSize()).arg(excludedLabel));
     }
     else
     {
-        ccLog::Warning("[qNoiseF] No 'Label' scalar field found. Processing all points.");
+        ccLog::Warning("[qNoiseF] No scalar field currently displayed on the selected cloud. All points will be processed (no label exclusion).");
     }
 
-    // Build octree if needed
+    // Build / get octree
     ccOctree::Shared octree = cloud->getOctree();
     if (!octree)
     {
@@ -133,133 +136,150 @@ void qNoiseF::doNoiseFilter(ccPointCloud* cloud, bool useRadius, double radius, 
         }
     }
 
-    // Progress dialog
-    QWidget* parentWidget = m_app ? m_app->getMainWindow() : nullptr;
-    ccProgressDialog pDlg(true, parentWidget);
+    // Progress dialog (nullptr parent to avoid QMainWindow forward-declare issues)
+    ccProgressDialog pDlg(true, nullptr);
     pDlg.setMethodTitle("Noise Filter with Label Exclusion");
     pDlg.setInfo("Filtering points...");
     pDlg.start();
 
-    ccLog::Print(QString("[qNoiseF] Processing %1 points (radius mode: %2, max error: %3, min neighbors: %4)")
-                 .arg(pointCount).arg(useRadius).arg(maxError).arg(minNeighbors));
-
-    // Mark points to keep
     std::vector<bool> keepPoint(pointCount, true);
     unsigned filteredCount = 0;
-    
-    // Process each point
+
+    // Main loop
     for (unsigned i = 0; i < pointCount; ++i)
     {
-        if (pDlg.wasCanceled())
+        if ((i % 1000) == 0)
         {
-            ccLog::Warning("[qNoiseF] Process canceled by user");
-            pDlg.stop();
-            return;
+            if (pDlg.wasCanceled())
+            {
+                ccLog::Warning("[qNoiseF] Process canceled by user");
+                pDlg.stop();
+                return;
+            }
+            pDlg.update(static_cast<float>(i) / pointCount * 100.0f);
         }
 
         const CCVector3* P = cloud->getPoint(i);
-        
-        // Build neighbor cloud (excluding points with excluded label)
+
+        // Protect points that themselves have the excluded label value:
+        if (labelSf && excludedLabel >= 0 && static_cast<int>(labelSf->getValue(i)) == excludedLabel)
+        {
+            // keep point, skip filtering for this point
+            continue;
+        }
+
+        // Build neighbor list excluding points whose SF value == excludedLabel
         CCCoreLib::ReferenceCloud neighbors(cloud);
-        
+
         if (useRadius)
         {
             // Radius-based search
-            CCCoreLib::DgmOctree::NeighboursSet neighborsSet;
-            octree->getPointsInSphericalNeighbourhood(*P, radius, neighborsSet, 1);
-            
-            for (const auto& n : neighborsSet)
+            CCCoreLib::DgmOctree::NeighboursSet neighboursSet;
+            unsigned char lvl = octree->findBestLevelForAGivenNeighbourhoodSizeExtraction(static_cast<PointCoordinateType>(radius));
+            // API: getPointsInSphericalNeighbourhood(point, radius, neighboursSet, level)
+            int foundNeighbors = octree->getPointsInSphericalNeighbourhood(*P, static_cast<PointCoordinateType>(radius), neighboursSet, lvl);
+
+            if (foundNeighbors > 0)
             {
-                unsigned idx = n.pointIndex;
-                if (idx == i) continue;
-                if (labelSf && static_cast<int>(labelSf->getValue(idx)) == excludedLabel)
-                    continue;
-                
-                neighbors.addPointIndex(idx);
+                for (const auto& pd : neighboursSet)
+                {
+                    unsigned idx = pd.pointIndex;
+                    if (idx == i) // skip self
+                        continue;
+
+                    if (labelSf && excludedLabel >= 0 && static_cast<int>(labelSf->getValue(idx)) == excludedLabel)
+                        continue;
+
+                    neighbors.addPointIndex(idx);
+                    if (static_cast<int>(neighbors.size()) >= knn)
+                        break;
+                }
             }
         }
         else
         {
-            // KNN-based search
-            CCCoreLib::DgmOctree::NeighboursSet neighborsSet;
-            int searchK = knn + 100; // Search extra to account for excluded labels
+            // KNN search: request more candidate neighbors to allow for excluded-label skipping
+            int searchK = std::max(3, knn * 3);
+            unsigned char lvlK = octree->findBestLevelForAGivenPopulationPerCell(static_cast<unsigned>(searchK));
+
+            // findPointNeighbourhood fills a ReferenceCloud provided by the caller
+            CCCoreLib::ReferenceCloud candidateRef(cloud);
             double maxSquareDist = 0;
-            
-            octree->findPointNeighbourhood(P, &neighborsSet, static_cast<unsigned>(searchK), 0, maxSquareDist);
-            
-            for (const auto& n : neighborsSet)
+            unsigned found = octree->findPointNeighbourhood(P, &candidateRef, static_cast<unsigned>(searchK), lvlK, maxSquareDist);
+
+            if (found > 0)
             {
-                unsigned idx = n.pointIndex;
-                if (idx == i) continue;
-                if (labelSf && static_cast<int>(labelSf->getValue(idx)) == excludedLabel)
-                    continue;
-                
-                neighbors.addPointIndex(idx);
-                
-                if (static_cast<int>(neighbors.size()) >= knn)
-                    break;
+                for (unsigned ci = 0; ci < candidateRef.size(); ++ci)
+                {
+                    unsigned idx = candidateRef.getPointGlobalIndex(ci);
+                    if (idx == i)
+                        continue;
+
+                    if (labelSf && excludedLabel >= 0 && static_cast<int>(labelSf->getValue(idx)) == excludedLabel)
+                        continue;
+
+                    neighbors.addPointIndex(idx);
+                    if (static_cast<int>(neighbors.size()) >= knn)
+                        break;
+                }
             }
         }
 
         unsigned neighborCount = neighbors.size();
 
-        // Check if point is isolated (optional removal)
+        // Isolation removal
         if (removeIsolated && static_cast<int>(neighborCount) < minNeighbors)
         {
             keepPoint[i] = false;
-            filteredCount++;
+            ++filteredCount;
             continue;
         }
 
-        // Need at least 3 neighbors to fit a plane
+        // Need at least 3 neighbors for plane fitting
         if (neighborCount < 3)
         {
-            // Can't fit plane, keep the point by default
-            continue;
-        }
-
-        // Fit a plane to the neighbors
-        CCCoreLib::Neighbourhood neighbourhood(&neighbors);
-        
-        const CCVector3* planeEquation = neighbourhood.getLSPlane();
-        if (!planeEquation)
-        {
-            // Plane fitting failed, keep the point
-            continue;
-        }
-
-        // Calculate distance from point to fitted plane
-        // Plane equation: N.x + d = 0, where planeEquation[0..2] is normal N and planeEquation[3] is d
-        const PointCoordinateType* N = planeEquation;
-        PointCoordinateType d = N[3];
-        
-        // Distance = |N.P + d| / |N|
-        PointCoordinateType distance = std::abs(N[0] * P->x + N[1] * P->y + N[2] * P->z + d);
-        
-        // Check if distance exceeds max error threshold
-        if (maxError > 0.0)
-        {
-            if (distance > maxError)
+            if (removeIsolated)
             {
                 keepPoint[i] = false;
-                filteredCount++;
+                ++filteredCount;
             }
+            continue;
         }
 
-        if (i % 1000 == 0)
+        // Fit plane
+        CCCoreLib::Neighbourhood neighbourhood(&neighbors);
+        const PointCoordinateType* planeEquation = neighbourhood.getLSPlane();
+        if (!planeEquation)
+            continue;
+
+        // planeEquation[0..2] = normal, [3] = d (N.x + d = 0)
+        const PointCoordinateType* N = planeEquation;
+        PointCoordinateType d = N[3];
+
+        PointCoordinateType normalLength = static_cast<PointCoordinateType>(std::sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]));
+        PointCoordinateType distance = 0;
+        if (normalLength > 0)
+            distance = std::abs(N[0] * P->x + N[1] * P->y + N[2] * P->z + d) / normalLength;
+
+        if (maxError > 0.0 && distance > maxError)
         {
-            pDlg.update(static_cast<float>(i) / pointCount * 100.0f);
+            keepPoint[i] = false;
+            ++filteredCount;
         }
     }
 
     pDlg.stop();
 
-    ccLog::Print(QString("[qNoiseF] Filtered %1 points out of %2 total points")
-                 .arg(filteredCount).arg(pointCount));
+    ccLog::Print(QString("[qNoiseF] Filtered %1 points out of %2 total points").arg(filteredCount).arg(pointCount));
 
-    // Create filtered cloud (points that passed the filter)
+    if (filteredCount == pointCount)
+    {
+        ccLog::Warning("[qNoiseF] All points were filtered!");
+        return;
+    }
+
+    // Build result ReferenceCloud from kept points
     CCCoreLib::ReferenceCloud refCloud(cloud);
-    
     for (unsigned i = 0; i < pointCount; ++i)
     {
         if (keepPoint[i])
@@ -268,7 +288,7 @@ void qNoiseF::doNoiseFilter(ccPointCloud* cloud, bool useRadius, double radius, 
 
     if (refCloud.size() == 0)
     {
-        ccLog::Warning("[qNoiseF] All points were filtered!");
+        ccLog::Warning("[qNoiseF] No points remain after filtering!");
         return;
     }
 
@@ -281,14 +301,14 @@ void qNoiseF::doNoiseFilter(ccPointCloud* cloud, bool useRadius, double radius, 
 
     filteredCloud->setName(cloud->getName() + QString(".filtered"));
     filteredCloud->setDisplay(cloud->getDisplay());
-    
+
     if (cloud->getParent())
         cloud->getParent()->addChild(filteredCloud);
-    
+
     if (m_app)
         m_app->addToDB(filteredCloud);
-    
+
     filteredCloud->prepareDisplayForRefresh();
-    
+
     ccLog::Print(QString("[qNoiseF] Created filtered cloud with %1 points").arg(filteredCloud->size()));
 }
